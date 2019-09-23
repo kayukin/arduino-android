@@ -1,11 +1,10 @@
 package com.kayukin.arduino;
 
-import androidx.appcompat.app.AppCompatActivity;
-
 import android.app.PendingIntent;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.hardware.usb.UsbDevice;
 import android.hardware.usb.UsbDeviceConnection;
 import android.hardware.usb.UsbManager;
@@ -13,14 +12,26 @@ import android.os.Bundle;
 import android.util.Log;
 import android.widget.TextView;
 
+import androidx.appcompat.app.AppCompatActivity;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.felhr.usbserial.UsbSerialDevice;
 import com.felhr.usbserial.UsbSerialInterface;
 import com.felhr.usbserial.UsbSerialInterface.UsbReadCallback;
 
-import java.io.UnsupportedEncodingException;
-import java.nio.charset.StandardCharsets;
+import org.jetbrains.annotations.NotNull;
+
+import java.io.IOException;
 import java.util.HashMap;
-import java.util.Map;
+
+import okhttp3.Call;
+import okhttp3.Callback;
+import okhttp3.Credentials;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.RequestBody;
+import okhttp3.Response;
+import okhttp3.internal.http2.Header;
 
 public class MainActivity extends AppCompatActivity {
     private static final String ACTION_USB_PERMISSION =
@@ -29,39 +40,61 @@ public class MainActivity extends AppCompatActivity {
     private UsbDevice device;
     UsbDeviceConnection connection;
     private UsbSerialDevice serialPort;
-    private TextView textView;
+    private TextView temperatureView;
+    private TextView humidityView;
+    private final ObjectMapper objectMapper = new ObjectMapper();
+    private final OkHttpClient client = new OkHttpClient();
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
         usbManager = getSystemService(UsbManager.class);
-        textView = findViewById(R.id.textView);
+        humidityView = findViewById(R.id.humidityView);
+        temperatureView = findViewById(R.id.temperatureView);
         initUsbConnection();
+        IntentFilter filter = new IntentFilter();
+        filter.addAction(ACTION_USB_PERMISSION);
+        filter.addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED);
+        filter.addAction(UsbManager.ACTION_USB_DEVICE_DETACHED);
+        registerReceiver(broadcastReceiver, filter);
     }
 
     final UsbReadCallback usbReadCallback = new UsbReadCallback() {
         // Определение метода обратного вызова, который вызывается при приеме данных.
         @Override
-        public void onReceivedData(byte[] arg0) {
-            String data = null;
-            data = new String(arg0, StandardCharsets.UTF_8) + "/n";
-            tvAppend(textView, data);
+        public void onReceivedData(byte[] bytes) {
+            try {
+                SensorsData sensorsData = objectMapper.readValue(bytes, SensorsData.class);
+                runOnUiThread(() -> {
+                    humidityView.setText(sensorsData.getHumidity().toString());
+                    temperatureView.setText(sensorsData.getTemperature().toString());
+                });
+                Request request = new Request.Builder()
+                        .url("https://kayukin.systems/api/sensors")
+                        .post(RequestBody.create(bytes))
+                        .header("Authorization", Credentials.basic("kayukin", "4rAw28kjgy2"))
+                        .header("Content-type", "application/json")
+                        .build();
+                client.newCall(request).enqueue(new Callback() {
+                    @Override
+                    public void onFailure(@NotNull Call call, @NotNull IOException e) {
+                        Log.d("HTTP", "Request failed");
+                    }
+
+                    @Override
+                    public void onResponse(@NotNull Call call, @NotNull Response response) throws IOException {
+                        if (response.isSuccessful()) {
+                            Log.d("HTTP", "Request ok");
+                        }
+                    }
+                });
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+
         }
     };
-
-    private void tvAppend(TextView tv, CharSequence text) {
-        final TextView ftv = tv;
-        final CharSequence ftext = text;
-
-        runOnUiThread(new Runnable() {
-            @Override
-            public void run() {
-                ftv.append(ftext);
-            }
-        });
-
-    }
 
     private final BroadcastReceiver broadcastReceiver = new BroadcastReceiver() {
         @Override
@@ -79,9 +112,7 @@ public class MainActivity extends AppCompatActivity {
                             serialPort.setStopBits(UsbSerialInterface.STOP_BITS_1);
                             serialPort.setParity(UsbSerialInterface.PARITY_NONE);
                             serialPort.setFlowControl(UsbSerialInterface.FLOW_CONTROL_OFF);
-                            serialPort.read(usbReadCallback); //
-                            tvAppend(textView, "Serial Connection Opened!\n");
-
+                            serialPort.read(usbReadCallback);
                         } else {
                             Log.d("SERIAL", "PORT NOT OPEN");
                         }
@@ -91,11 +122,10 @@ public class MainActivity extends AppCompatActivity {
                 } else {
                     Log.d("SERIAL", "PERM NOT GRANTED");
                 }
-//            } else if (intent.getAction().equals(UsbManager.ACTION_USB_DEVICE_ATTACHED)) {
-//                onClickStart(startButton);
-//            } else if (intent.getAction().equals(UsbManager.ACTION_USB_DEVICE_DETACHED)) {
-//                onClickStop(stopButton);
-//            }
+            } else if (UsbManager.ACTION_USB_DEVICE_ATTACHED.equals(intent.getAction())) {
+                initUsbConnection();
+            } else if (UsbManager.ACTION_USB_DEVICE_DETACHED.equals(intent.getAction())) {
+                initUsbConnection();
             }
         }
     };
@@ -103,24 +133,11 @@ public class MainActivity extends AppCompatActivity {
     private void initUsbConnection() {
         HashMap<String, UsbDevice> usbDevices = usbManager.getDeviceList();
         if (!usbDevices.isEmpty()) {
-            boolean keep = true;
-            for (Map.Entry<String, UsbDevice> entry : usbDevices.entrySet()) {
-                device = entry.getValue();
-                int deviceVID = device.getVendorId();
-                if (deviceVID == 0x2341)   //Arduino Vendor ID
-                {
-                    PendingIntent pi = PendingIntent.getBroadcast(this, 0,
-                            new Intent(ACTION_USB_PERMISSION), 0);
-                    usbManager.requestPermission(device, pi);
-                    keep = false;
-                } else {
-                    connection = null;
-                    device = null;
-                }
+            device = usbDevices.entrySet().iterator().next().getValue();
 
-                if (!keep)
-                    break;
-            }
+            PendingIntent pi = PendingIntent.getBroadcast(this, 0,
+                    new Intent(ACTION_USB_PERMISSION), 0);
+            usbManager.requestPermission(device, pi);
         }
     }
 }
